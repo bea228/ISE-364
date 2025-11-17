@@ -61,6 +61,7 @@ class PDVModel:
             r2[t]= np.sum(kernels* past_return**2)
         return r2
     
+    
     def get_sigma_t(self,returns):
         return np.sqrt(self.get_r2(returns))
     
