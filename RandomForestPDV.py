@@ -1,105 +1,108 @@
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
 import matplotlib.pyplot as plt
-from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error
 
-class PDVModel:
+class RandomForestPDV:
     
-    def __init__(self,alpha1,delta1,alpha2, delta2):
-        self.alpha1 = alpha1
-        self.delta1= delta1
-        self.alpha2 = alpha2
-        self.delta2= delta2
-        self.scaler = StandardScaler()
-    
-    def kernel(self,alpha,delta,tau):
-        '''
-         K(tau) = Z_alpha,delta^(-1) * (tau + delta)^(-alpha), with constraints: tau >= 0, alpha > 1, delta > 0
-        z alpha delta is the normalization constant which is delta^(1-alpha) / (alpha-1)
-        alpha is power-law exponent(determines memory structure so large a mean quick decay)
-        tau is time elapsed since past event
-        delta is the time shift which helps the kernel from blowing up if tau=0
+    def __init__( self, n_estimators=100,max_depth=None):
         
-        '''
-        z_inverse = ((delta**(1-alpha)) / (alpha-1))**-1
-        kernel_output  = z_inverse * ((tau+delta)**(-alpha))
-        return kernel_output
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.model= None
+        self.feature_importance = None
+        self.scaler = StandardScaler()
+
+    def exp_kernel(self, lam, tau):
+        '''Exponential kernel: K(τ) = λ·exp(-λτ/365)'''
+        K = lam * np.exp(-lam * tau / 365.0)#365 as foreign exchange is 24/7
+        return K / K.sum()
+    
+    
     def compute_returns(self, prices:list):
         '''
         In the paper returns are defined as  r_t = (S_t - S_{t-1}) / S_{t-1}
         '''
         prices = np.array(prices)
-        returns = (np.diff(prices) / prices[:-1])*100
+        returns =np.diff(prices) / prices[:-1]
+        returns = returns*100
         return np.concatenate([[0], returns])
     
-    def get_r1(self,returns):
-        '''
-        returns assumed to be numpy 
-        in paper R1_t = Σ K1(t - t_i) * r_{t_i}
-        '''
-        r1= np.zeros(len(returns))
-        for t in range(len(returns)):
-            if t==0:
-                r1[t]= 0.0
-                continue
-            past_return = returns[:t]
-            taus = t- np.arange(0,t)
-            kernels = self.kernel(self.alpha1,self.delta1,taus)
-            r1[t]= np.sum(kernels*past_return)
-        return r1*100
-    def get_r2(self,returns):
-        '''
-        returns assumed to be numpy 
-        R2_t = Σ K2(t - t_i) * r_{t_i}^2
-        '''
-        r2= np.zeros(len(returns))
-        for t in range(len(returns)):
-            if t==0:
-                r2[t]= 0.0
-                continue
-            past_return = returns[:t]
-            taus = t- np.arange(0,t)
-            kernels = self.kernel(self.alpha2,self.delta2,taus)
-            r2[t]= np.sum(kernels* past_return**2)
-        return r2
-    
-    
-    def get_sigma_t(self,returns):
-        return np.sqrt(self.get_r2(returns))* np.sqrt(4380)
-    
-    
-    def find_features(self,prices):
-        #find r1 and Σ_t then put it in df
+    def find_features(self, prices):
+        '''Compute features for XGBoost model'''
         returns = self.compute_returns(prices)
+        n = len(returns)
+        lags = np.arange(500)
         
-        features= pd.DataFrame({
-            'R1': self.get_r1(returns),
-            'Sigma_t': self.get_sigma_t(returns),
-            'returns': returns
-        })
+        features = pd.DataFrame()
+        
+        # Multi-scale R1, R2, Sigma at different timescales
+        K = self.exp_kernel(5, lags)#using a lambda of 5
+        R1_l, R2_l = np.zeros(n), np.zeros(n)
+        for t in range(500, n):
+            past = returns[t-500:t][::-1]
+            R1_l[t] = np.sum(K * past)
+            R2_l[t] = np.sum(K * past ** 2)
+        features[f'R1_l{5}'] = R1_l
+        features[f'R2_l{5}'] = R2_l
+        features[f'Sigma_l{5}'] = np.sqrt(np.maximum(R2_l, 1e-10))
+
+        features['VoV_50'] = self.compute_vol_of_vol(returns, window=50)
+
+        features['jump_flag'] = self.compute_jump_indicator(returns, window=50)
+
         return features
+    def compute_raw_rvol(self, returns, window=50):
+        rvol = np.zeros(len(returns))
+        for t in range(window, len(returns)):
+            rvol[t] = np.sqrt(np.mean(returns[t-window:t]**2))
+        return rvol
+
+    def compute_vol_of_vol(self, returns, window=50):
+        rvol = self.compute_raw_rvol(returns, window)
+        vov = pd.Series(rvol).rolling(window).std().fillna(0).values
+        return vov
+    def compute_jump_indicator(self, returns, window=50):
+        rolling_std = pd.Series(returns).rolling(window).std().fillna(0)
+        jumps = (np.abs(returns) > 1.75 * rolling_std).astype(int).values
+        return jumps
+    
+    
     def fit(self, prices, volatility):
         '''
         PDV model is fit with training data
         '''
         feats = self.find_features(prices)
-        x = feats[['R1','Sigma_t']].values
-        y = np.array(volatility)
         
-        regression = LinearRegression(fit_intercept=True)
-        regression.fit(x,y)
-        self.beta0 = regression.intercept_
-        self.beta1= regression.coef_[0]
-        self.beta2= regression.coef_[1]
+
+        self.features = feats
+        
+        x = feats[['R1_l5', 'Sigma_l5','VoV_50','jump_flag']].values[:-1]
+        y = np.array(volatility)[1:]
+        X_scaled = self.scaler.fit_transform(x)
+
+        
+    
+        self.model = RandomForestRegressor(n_estimators=self.n_estimators, max_depth=self.max_depth,random_state=42)
+        self.model.fit(X_scaled, y)
+        self.feature_importance= self.model.feature_importances_
+        
+        
         return self
     def predict(self, prices):
         features = self.find_features(prices)
-        predictions = (self.beta0 + self.beta1 * features['R1'] + self.beta2 * features['Sigma_t'])
-        return predictions.values
+        x = features[['R1_l5', 'Sigma_l5','VoV_50','jump_flag']].values
+        X_scaled = self.scaler.transform(x)
+        predictions = self.model.predict(X_scaled)
+        return predictions
     
-    def plot_model_performance(self, predictions, actual_volatility, #used ai to create this
+    
+    
+    
+    
+    def plot_model_performance(self, predictions, actual_volatility, 
                           model_name='Model', n_points=500):
         """
         Create a comprehensive visualization of model performance including:
@@ -185,7 +188,3 @@ class PDVModel:
         
         plt.tight_layout()
         return fig
-
-
-    
-    
